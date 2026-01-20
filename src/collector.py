@@ -65,18 +65,20 @@ class Collector:
     Bucket stats collector with continuous incremental updates.
     
     Key features:
-    - Bootstrap mode: Fast initial collection with max parallelism
+    - Bootstrap mode: Fast initial collection with bulk command
     - Auto-scaling workers: Adjusts based on bucket count
     - Continuous mode: Runs as daemon, updating stale buckets
     - Incremental updates: Only collects buckets older than threshold
     - Sync collection: Optional multisite sync status
     - Graceful shutdown: Ctrl+C stops cleanly
+    - JSON cache: Exports stats for lock-free dashboard access
     """
     
     def __init__(self, config: CollectorConfig, 
                  rgw_client: RGWAdminClient = None,
                  storage: Storage = None,
-                 output_callback: Callable[[str], None] = None):
+                 output_callback: Callable[[str], None] = None,
+                 cache_path: str = None):
         self.config = config
         self.rgw_client = rgw_client or RGWAdminClient(
             ceph_conf=config.ceph_conf,
@@ -86,9 +88,28 @@ class Collector:
         self.state = CollectorState()
         self.output = output_callback or print
         
+        # JSON cache for dashboard (avoids DB lock)
+        self.cache_path = cache_path
+        self._cache = None
+        if cache_path:
+            from .cache import StatsCache
+            self._cache = StatsCache(cache_path)
+        
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _update_cache(self):
+        """Update JSON cache for dashboard access."""
+        if not self._cache:
+            return
+        
+        try:
+            from .cache import build_cache_data
+            data = build_cache_data(self.storage)
+            self._cache.write(data)
+        except Exception as e:
+            self.output(f"  Warning: Failed to update cache: {e}")
     
     def _signal_handler(self, signum, frame):
         """Handle interrupt signals."""
@@ -184,70 +205,141 @@ class Collector:
     def run_bootstrap(self, verbose: bool = True) -> dict:
         """
         Bootstrap mode: Fast initial collection for cold start.
-        Uses maximum parallelism and ignores stale checks.
+        
+        Uses single radosgw-admin command to fetch ALL buckets at once.
+        Much faster than per-bucket: ~3 min for 28K buckets.
         """
         start_time = time.time()
         
         self.output("\n" + "=" * 60)
-        self.output("BOOTSTRAP MODE - Initial Collection")
+        self.output("BOOTSTRAP MODE - Bulk Collection")
         self.output("=" * 60)
-        self.output(f"  Max workers:     {self.config.bootstrap_workers}")
-        self.output(f"  Batch size:      {self.config.batch_size}")
-        self.output(f"  Collect sync:    {self.config.collect_sync_status}")
+        self.output("  Method: radosgw-admin bucket stats (single command)")
+        self.output("  Updates: ALL buckets")
         self.output("=" * 60)
         
-        # Get all buckets
-        self.output("  Fetching bucket list...")
-        all_buckets = self.rgw_client.get_all_buckets()
-        total = len(all_buckets)
-        self.output(f"  Found {total} total buckets")
+        result = self.run_bulk_refresh(verbose=verbose)
         
-        if total == 0:
-            return {'collected': 0, 'duration': 0, 'mode': 'bootstrap'}
+        # Update cache for dashboard
+        self._update_cache()
+        if self._cache and verbose:
+            self.output(f"  Cache updated: {self.cache_path}")
         
-        # Check what we already have
-        existing = len(self.storage.get_summary().get('total_buckets', 0) or 0)
-        uncollected = self.storage.get_uncollected_buckets(all_buckets, limit=total)
-        
-        self.output(f"  Already in DB:   {existing}")
-        self.output(f"  Need to collect: {len(uncollected)}")
-        
-        if not uncollected:
-            self.output("  All buckets already collected!")
-            return {'collected': 0, 'duration': time.time() - start_time, 'mode': 'bootstrap'}
-        
-        # Calculate optimal workers
-        workers = self.config.bootstrap_workers
-        self.output(f"  Using {workers} workers")
-        self.output("-" * 60)
-        
-        # Collect all uncollected buckets
-        collected = self.collect_buckets(uncollected, workers=workers, verbose=verbose)
-        
-        duration = time.time() - start_time
-        rate = collected / duration if duration > 0 else 0
+        total_duration = time.time() - start_time
+        rate = result['collected'] / total_duration if total_duration > 0 else 0
         
         self.output("\n" + "=" * 60)
         self.output("BOOTSTRAP COMPLETE")
         self.output("=" * 60)
-        self.output(f"  Collected:    {collected} buckets")
-        self.output(f"  Duration:     {duration:.1f}s")
-        self.output(f"  Rate:         {rate:.1f} buckets/sec")
+        self.output(f"  Buckets collected: {result['collected']}")
+        self.output(f"  Total time:        {total_duration:.1f}s")
+        self.output(f"  Rate:              {rate:.0f} buckets/sec")
+        if result.get('errors', 0) > 0:
+            self.output(f"  Errors:            {result['errors']}")
         self.output("=" * 60 + "\n")
         
-        return {'collected': collected, 'duration': duration, 'rate': rate, 'mode': 'bootstrap'}
+        return {
+            'collected': result['collected'], 
+            'duration': total_duration, 
+            'rate': rate,
+            'errors': result.get('errors', 0),
+            'mode': 'bootstrap'
+        }
     
-    def run_once(self, limit: int = None, verbose: bool = False) -> dict:
+    def run_bulk_refresh(self, verbose: bool = True) -> dict:
+        """
+        Refresh ALL buckets using single bulk command.
+        
+        When bulk is used, we update ALL buckets because:
+        1. We already fetched all data (can't fetch partial)
+        2. Writing to DB is fast compared to fetch time
+        3. Keeps all data fresh
+        
+        Args:
+            verbose: Print progress
+        """
+        start_time = time.time()
+        
+        if verbose:
+            self.output("  Bulk mode: Fetching and updating ALL buckets...")
+        
+        # Get all bucket stats in ONE command
+        log_func = self.output if verbose else None
+        all_stats = self.rgw_client.get_all_bucket_stats_bulk(timeout=1800, log_callback=log_func)
+        
+        if not all_stats:
+            return {
+                'fetched': 0,
+                'collected': 0,
+                'errors': 0,
+                'duration': time.time() - start_time,
+                'mode': 'bulk'
+            }
+        
+        # Save ALL to database
+        if verbose:
+            self.output(f"  Saving {len(all_stats)} buckets to database...")
+        
+        save_start = time.time()
+        saved = 0
+        errors = 0
+        
+        for stats in all_stats:
+            if not self.state.is_running():
+                if verbose:
+                    self.output(f"  Interrupted! Saved {saved} buckets before stop.")
+                break
+            
+            try:
+                self.storage.upsert_bucket_stats(stats)
+                saved += 1
+                self.state.increment_collected()
+                
+                # Commit every 500 buckets
+                if saved % 500 == 0:
+                    self.storage.commit()
+                    if verbose:
+                        self.output(f"    Saved: {saved}/{len(all_stats)} buckets...")
+            except Exception as e:
+                errors += 1
+                if verbose and errors <= 5:
+                    self.output(f"    ERROR saving {stats.bucket_name}: {e}")
+        
+        self.storage.commit()
+        
+        save_time = time.time() - save_start
+        total_duration = time.time() - start_time
+        
+        if verbose:
+            self.output(f"  Summary: Fetched {len(all_stats)}, Saved {saved}, Errors {errors}")
+            self.output(f"  Save time: {save_time:.1f}s, Total time: {total_duration:.1f}s")
+        
+        return {
+            'fetched': len(all_stats),
+            'collected': saved,
+            'errors': errors,
+            'duration': total_duration,
+            'mode': 'bulk'
+        }
+    
+    def run_once(self, limit: int = None, verbose: bool = False,
+                 bulk_threshold: int = 500) -> dict:
         """
         Run a single collection cycle.
         
-        Collects buckets that are:
-        - Not in DB (uncollected), OR
-        - In DB but older than stale_threshold
+        Strategy decision:
+        - If stale buckets > bulk_threshold: Use BULK (updates ALL buckets)
+        - If stale buckets <= bulk_threshold: Use per-bucket (updates only stale)
+        
+        Note: Bulk mode always updates ALL buckets because:
+        1. radosgw-admin returns all-or-nothing (can't fetch partial)
+        2. If we fetch all, might as well update all
+        3. Keeps entire dataset fresh
         
         Args:
-            limit: Max buckets to collect (None = all stale buckets)
+            limit: Max buckets for per-bucket mode (ignored in bulk mode)
             verbose: Print progress
+            bulk_threshold: Use bulk if more than this many stale (default 500)
         """
         cycle_start = time.time()
         
@@ -256,8 +348,7 @@ class Collector:
             self.output("COLLECTION CYCLE")
             self.output("=" * 60)
             self.output(f"  Stale threshold: {self.config.stale_threshold_seconds}s")
-            if limit:
-                self.output(f"  *** LIMIT: Max {limit} buckets ***")
+            self.output(f"  Bulk threshold:  {bulk_threshold} buckets")
         
         # Get all bucket names from RGW
         if verbose:
@@ -274,34 +365,27 @@ class Collector:
         in_db = summary.get('total_buckets', 0) or 0
         
         if verbose:
-            self.output(f"  Buckets already in DB: {in_db}")
+            self.output(f"  Buckets in DB: {in_db}")
         
-        # Get uncollected count (for debugging)
+        # Get uncollected buckets (not in DB)
         uncollected = self.storage.get_uncollected_buckets(all_buckets, limit=total_buckets)
         
         if verbose:
             self.output(f"  Uncollected (not in DB): {len(uncollected)}")
         
-        # Get stale count (for debugging)
-        stale_count = self.storage.get_stale_count(self.config.stale_threshold_seconds)
-        
-        if verbose:
-            self.output(f"  Stale (older than {self.config.stale_threshold_seconds}s): {stale_count}")
-        
-        # Get buckets to update
-        # If no limit, get all that need updating
-        effective_limit = limit if limit else (total_buckets + 1000)
-        
-        buckets_to_update = self.storage.get_buckets_to_update(
-            all_buckets,
-            self.config.stale_threshold_seconds,
-            limit=effective_limit
+        # Get stale buckets (in DB but old)
+        stale_buckets = self.storage.get_stale_buckets(
+            self.config.stale_threshold_seconds, 
+            limit=total_buckets
         )
         
         if verbose:
-            self.output(f"  Will collect: {len(buckets_to_update)} buckets")
+            self.output(f"  Stale (older than {self.config.stale_threshold_seconds}s): {len(stale_buckets)}")
         
-        if not buckets_to_update:
+        # Total needing update
+        total_to_update = len(uncollected) + len(stale_buckets)
+        
+        if total_to_update == 0:
             if verbose:
                 self.output("  ✓ All buckets are up to date!")
             return {
@@ -309,40 +393,71 @@ class Collector:
                 'duration': time.time() - cycle_start,
                 'total_buckets': total_buckets,
                 'in_db': in_db,
-                'uncollected': len(uncollected),
-                'stale': stale_count,
-                'workers': 0
+                'stale': 0,
+                'mode': 'none'
             }
         
-        # Calculate workers
-        workers = self.config.calculate_workers(len(buckets_to_update))
+        # Decide strategy
+        use_bulk = total_to_update > bulk_threshold
+        
+        if use_bulk:
+            # BULK MODE: Fetch all, update all
+            if verbose:
+                self.output(f"  Strategy: BULK (stale {total_to_update} > threshold {bulk_threshold})")
+                self.output(f"  Note: Bulk mode updates ALL {total_buckets} buckets")
+            
+            result = self.run_bulk_refresh(verbose=verbose)
+            result['total_buckets'] = total_buckets
+            result['in_db'] = in_db
+            result['stale'] = total_to_update
+            
+        else:
+            # PER-BUCKET MODE: Update only stale buckets
+            if verbose:
+                self.output(f"  Strategy: Per-bucket (stale {total_to_update} <= threshold {bulk_threshold})")
+            
+            # Combine uncollected + stale
+            buckets_to_update = list(set(uncollected) | set(stale_buckets))
+            
+            # Apply limit if specified
+            if limit and len(buckets_to_update) > limit:
+                buckets_to_update = buckets_to_update[:limit]
+            
+            if verbose:
+                self.output(f"  Will collect: {len(buckets_to_update)} buckets")
+            
+            # Calculate workers
+            workers = self.config.calculate_workers(len(buckets_to_update))
+            if verbose:
+                self.output(f"  Using {workers} workers")
+                self.output("-" * 60)
+            
+            # Collect per-bucket
+            collected = self.collect_buckets(buckets_to_update, workers=workers, verbose=verbose)
+            
+            cycle_duration = time.time() - cycle_start
+            self.state.record_cycle(collected, cycle_duration, workers)
+            
+            result = {
+                'collected': collected, 
+                'duration': cycle_duration, 
+                'workers': workers,
+                'total_buckets': total_buckets,
+                'in_db': in_db,
+                'stale': total_to_update,
+                'mode': 'per-bucket'
+            }
+        
         if verbose:
-            self.output(f"  Using {workers} workers")
             self.output("-" * 60)
-        
-        # Collect
-        collected = self.collect_buckets(buckets_to_update, workers=workers, verbose=verbose)
-        
-        cycle_duration = time.time() - cycle_start
-        self.state.record_cycle(collected, cycle_duration, workers)
-        
-        if verbose:
-            self.output("-" * 60)
-            self.output(f"  Collected: {collected} buckets")
-            self.output(f"  Duration:  {cycle_duration:.1f}s")
-            if cycle_duration > 0:
-                self.output(f"  Rate:      {collected/cycle_duration:.1f} buckets/sec")
+            self.output(f"  Collected: {result['collected']} buckets")
+            self.output(f"  Duration:  {result['duration']:.1f}s")
+            if result['duration'] > 0:
+                self.output(f"  Rate:      {result['collected']/result['duration']:.1f} buckets/sec")
+            self.output(f"  Mode:      {result['mode']}")
             self.output("=" * 60 + "\n")
         
-        return {
-            'collected': collected, 
-            'duration': cycle_duration, 
-            'workers': workers,
-            'total_buckets': total_buckets,
-            'in_db': in_db,
-            'uncollected': len(uncollected),
-            'stale': stale_count
-        }
+        return result
     
     def run_continuous(self, verbose: bool = False):
         """
@@ -351,8 +466,9 @@ class Collector:
         Each cycle:
         1. Find buckets older than stale_threshold (or not in DB)
         2. Collect them
-        3. Sleep for refresh_interval
-        4. Repeat
+        3. Update JSON cache (for dashboard access)
+        4. Sleep for refresh_interval
+        5. Repeat
         """
         self.output("\n" + "=" * 60)
         self.output("CONTINUOUS COLLECTION MODE")
@@ -363,6 +479,8 @@ class Collector:
                    f"({self.config.refresh_interval_seconds // 60} min)")
         self.output(f"  Max workers:      {self.config.max_workers}")
         self.output(f"  Collect sync:     {self.config.collect_sync_status}")
+        if self._cache:
+            self.output(f"  Cache file:       {self.cache_path}")
         self.output("=" * 60)
         self.output("  Press Ctrl+C to stop\n")
         
@@ -377,6 +495,9 @@ class Collector:
             
             if not self.state.is_running():
                 break
+            
+            # Update cache for dashboard
+            self._update_cache()
             
             # Summary
             if result['collected'] == 0:
@@ -421,4 +542,5 @@ class Collector:
     
     def close(self):
         """Clean up resources."""
-        self.storage.close()
+        if self.storage:
+            self.storage.close()

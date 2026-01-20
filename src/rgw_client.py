@@ -83,6 +83,104 @@ class RGWAdminClient:
             print(f"ERROR: Failed to parse bucket list JSON: {e}")
             return []
     
+    def get_all_bucket_stats_bulk(self, timeout: int = 1800, log_callback=None) -> List[BucketStats]:
+        """
+        Get stats for ALL buckets in a single command.
+        
+        This is MUCH faster than per-bucket commands:
+        - Single process spawn
+        - Single RADOS authentication  
+        - Single metadata scan
+        
+        For 28K buckets: ~3 minutes vs ~30 minutes with per-bucket calls.
+        
+        Note: radosgw-admin outputs all data at once (not streaming),
+        so we wait for complete output then parse.
+        
+        Args:
+            timeout: Command timeout (default 30 min for large clusters)
+            log_callback: Optional function(message) for progress logging
+        
+        Returns:
+            List of BucketStats for all buckets
+        """
+        import time as time_module
+        
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+        
+        cmd = [self.rgw_admin, "-c", self.ceph_conf, "bucket", "stats", "--format=json"]
+        
+        log(f"  [BULK] Executing: radosgw-admin bucket stats")
+        log(f"  [BULK] Waiting for response (typically 2-5 minutes for large clusters)...")
+        
+        start_time = time_module.time()
+        
+        try:
+            # Simple subprocess.run - wait for complete output
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            fetch_time = time_module.time() - start_time
+            log(f"  [BULK] Command completed in {fetch_time:.1f}s")
+            
+            if result.returncode != 0:
+                log(f"  [BULK] ERROR: Command failed: {result.stderr}")
+                return []
+            
+            if not result.stdout or not result.stdout.strip():
+                log(f"  [BULK] WARNING: Empty response")
+                return []
+            
+            # Parse JSON
+            log(f"  [BULK] Parsing JSON response...")
+            parse_start = time_module.time()
+            
+            data = json.loads(result.stdout)
+            
+            if not isinstance(data, list):
+                data = [data]
+            
+            parse_time = time_module.time() - parse_start
+            log(f"  [BULK] Parsed {len(data)} buckets in {parse_time:.1f}s")
+            
+            # Convert to BucketStats objects
+            log(f"  [BULK] Converting to BucketStats objects...")
+            results = []
+            
+            for i, raw in enumerate(data):
+                if isinstance(raw, dict) and raw.get('bucket'):
+                    try:
+                        stats = self._parse_stats(raw, 0)
+                        results.append(stats)
+                    except Exception as e:
+                        log(f"  [BULK] ERROR parsing bucket {raw.get('bucket', 'unknown')}: {e}")
+                
+                # Progress every 5000 buckets
+                if (i + 1) % 5000 == 0:
+                    log(f"  [BULK] Processed {i + 1}/{len(data)} buckets...")
+            
+            total_time = time_module.time() - start_time
+            log(f"  [BULK] Complete: {len(results)} buckets in {total_time:.1f}s")
+            
+            return results
+            
+        except subprocess.TimeoutExpired:
+            elapsed = time_module.time() - start_time
+            log(f"  [BULK] ERROR: Command timed out after {elapsed:.0f}s (limit: {timeout}s)")
+            return []
+        except json.JSONDecodeError as e:
+            log(f"  [BULK] ERROR: Failed to parse JSON: {e}")
+            return []
+        except Exception as e:
+            log(f"  [BULK] ERROR: {e}")
+            return []
+    
     def get_bucket_stats(self, bucket_name: str, tenant: str = "") -> Optional[BucketStats]:
         """Get statistics for a single bucket."""
         start_time = time.time()
@@ -212,42 +310,70 @@ class RGWAdminClient:
         return stats
     
     def _parse_stats(self, raw: Dict[str, Any], duration_seconds: float) -> BucketStats:
-        """Parse raw JSON into BucketStats."""
+        """Parse raw JSON into BucketStats - captures ALL fields."""
+        from datetime import datetime
+        
         usage = raw.get('usage', {})
         
-        # Extract storage classes and calculate totals
-        storage_classes = {}
+        # Calculate totals from usage
         total_size = 0
         total_size_actual = 0
+        total_size_utilized = 0
         total_objects = 0
         
         for key, value in usage.items():
             if isinstance(value, dict):
-                size = value.get('size', 0) or 0
-                size_actual = value.get('size_actual', 0) or 0
-                num_objects = value.get('num_objects', 0) or 0
-                
-                storage_classes[key] = {
-                    'size': size,
-                    'size_actual': size_actual,
-                    'num_objects': num_objects
-                }
-                
-                total_size += size
-                total_size_actual += size_actual
-                total_objects += num_objects
+                total_size += value.get('size', 0) or 0
+                total_size_actual += value.get('size_actual', 0) or 0
+                total_size_utilized += value.get('size_utilized', 0) or 0
+                total_objects += value.get('num_objects', 0) or 0
         
         return BucketStats(
+            # Basic identifiers
             bucket_name=raw.get('bucket', ''),
             bucket_id=raw.get('id', ''),
+            marker=raw.get('marker', ''),
             tenant=raw.get('tenant', ''),
             owner=raw.get('owner', ''),
+            
+            # Placement
             zonegroup=raw.get('zonegroup', ''),
             placement_rule=raw.get('placement_rule', ''),
+            explicit_placement=raw.get('explicit_placement', {}),
+            
+            # Sharding & indexing
             num_shards=raw.get('num_shards', 0) or 0,
+            index_type=raw.get('index_type', 'Normal'),
+            
+            # Versioning & features
+            versioning=raw.get('versioning', 'off'),
+            versioned=raw.get('versioned', False),
+            versioning_enabled=raw.get('versioning_enabled', False),
+            object_lock_enabled=raw.get('object_lock_enabled', False),
+            mfa_enabled=raw.get('mfa_enabled', False),
+            
+            # Version markers
+            ver=raw.get('ver', ''),
+            master_ver=raw.get('master_ver', ''),
+            max_marker=raw.get('max_marker', ''),
+            
+            # Timestamps
+            mtime=raw.get('mtime', ''),
+            creation_time=raw.get('creation_time', ''),
+            
+            # Usage totals
             size_bytes=total_size,
             size_actual_bytes=total_size_actual,
+            size_utilized_bytes=total_size_utilized,
             num_objects=total_objects,
-            storage_classes=storage_classes,
+            
+            # Full usage data
+            usage=usage,
+            
+            # Quota
+            bucket_quota=raw.get('bucket_quota', {}),
+            
+            # Collection metadata - EXPLICITLY set timestamp
+            collected_at=datetime.utcnow(),
             collection_duration_ms=int(duration_seconds * 1000)
         )

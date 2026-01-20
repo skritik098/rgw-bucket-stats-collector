@@ -21,23 +21,83 @@ class Storage:
         self.db_path = db_path
         self.conn = duckdb.connect(db_path)
         self._init_schema()
+        self._migrate_schema()
+    
+    def _migrate_schema(self):
+        """Check and migrate schema if needed."""
+        # Get current columns
+        try:
+            result = self.conn.execute("""
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'bucket_stats'
+            """).fetchall()
+            existing_cols = {r[0] for r in result}
+        except:
+            return  # Table doesn't exist yet
+        
+        # Define expected columns and their types
+        expected_cols = {
+            'marker': 'VARCHAR',
+            'explicit_placement': 'JSON',
+            'index_type': 'VARCHAR',
+            'versioning': 'VARCHAR',
+            'versioned': 'BOOLEAN',
+            'versioning_enabled': 'BOOLEAN',
+            'object_lock_enabled': 'BOOLEAN',
+            'mfa_enabled': 'BOOLEAN',
+            'ver': 'VARCHAR',
+            'master_ver': 'VARCHAR',
+            'max_marker': 'VARCHAR',
+            'mtime': 'VARCHAR',
+            'creation_time': 'VARCHAR',
+            'size_utilized_bytes': 'BIGINT',
+            'usage': 'JSON',
+            'bucket_quota': 'JSON',
+        }
+        
+        # Add missing columns
+        for col, dtype in expected_cols.items():
+            if col not in existing_cols:
+                try:
+                    default = "'{}'" if dtype == 'JSON' else ("''" if dtype == 'VARCHAR' else ('false' if dtype == 'BOOLEAN' else '0'))
+                    self.conn.execute(f"ALTER TABLE bucket_stats ADD COLUMN {col} {dtype} DEFAULT {default}")
+                except:
+                    pass  # Column might already exist or other issue
+        
+        self.conn.commit()
     
     def _init_schema(self):
         """Initialize database schema."""
         # Main bucket stats table - single row per bucket (latest stats)
+        # Stores ALL fields from radosgw-admin bucket stats
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS bucket_stats (
                 bucket_name VARCHAR PRIMARY KEY,
                 bucket_id VARCHAR,
+                marker VARCHAR,
                 tenant VARCHAR,
                 owner VARCHAR,
                 zonegroup VARCHAR,
                 placement_rule VARCHAR,
+                explicit_placement JSON,
                 num_shards INTEGER,
+                index_type VARCHAR,
+                versioning VARCHAR,
+                versioned BOOLEAN,
+                versioning_enabled BOOLEAN,
+                object_lock_enabled BOOLEAN,
+                mfa_enabled BOOLEAN,
+                ver VARCHAR,
+                master_ver VARCHAR,
+                max_marker VARCHAR,
+                mtime VARCHAR,
+                creation_time VARCHAR,
                 size_bytes BIGINT,
                 size_actual_bytes BIGINT,
+                size_utilized_bytes BIGINT,
                 num_objects BIGINT,
-                storage_classes JSON,
+                usage JSON,
+                bucket_quota JSON,
                 sync_status VARCHAR,
                 sync_behind_shards INTEGER,
                 sync_behind_entries INTEGER,
@@ -71,6 +131,8 @@ class Storage:
                 bucket_name VARCHAR,
                 storage_class VARCHAR,
                 size_bytes BIGINT,
+                size_actual_bytes BIGINT,
+                size_utilized_bytes BIGINT,
                 num_objects BIGINT,
                 collected_at TIMESTAMP,
                 PRIMARY KEY (bucket_name, storage_class)
@@ -87,17 +149,53 @@ class Storage:
     
     def upsert_bucket_stats(self, stats: BucketStats, save_history: bool = True):
         """Insert or update bucket statistics."""
-        # Upsert main stats
+        # Upsert main stats with explicit column names
         self.conn.execute("""
-            INSERT OR REPLACE INTO bucket_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO bucket_stats (
+                bucket_name, bucket_id, marker, tenant, owner, zonegroup,
+                placement_rule, explicit_placement, num_shards, index_type,
+                versioning, versioned, versioning_enabled, object_lock_enabled,
+                mfa_enabled, ver, master_ver, max_marker, mtime, creation_time,
+                size_bytes, size_actual_bytes, size_utilized_bytes, num_objects,
+                usage, bucket_quota, sync_status, sync_behind_shards,
+                sync_behind_entries, sync_source_zone, collected_at, collection_duration_ms
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
         """, [
-            stats.bucket_name, stats.bucket_id, stats.tenant, stats.owner,
-            stats.zonegroup, stats.placement_rule, stats.num_shards,
-            stats.size_bytes, stats.size_actual_bytes, stats.num_objects,
-            json.dumps(stats.storage_classes),
-            stats.sync_status, stats.sync_behind_shards, stats.sync_behind_entries,
+            stats.bucket_name,
+            stats.bucket_id,
+            stats.marker,
+            stats.tenant,
+            stats.owner,
+            stats.zonegroup,
+            stats.placement_rule,
+            json.dumps(stats.explicit_placement) if stats.explicit_placement else '{}',
+            stats.num_shards,
+            stats.index_type,
+            stats.versioning,
+            stats.versioned,
+            stats.versioning_enabled,
+            stats.object_lock_enabled,
+            stats.mfa_enabled,
+            stats.ver,
+            stats.master_ver,
+            stats.max_marker,
+            stats.mtime,
+            stats.creation_time,
+            stats.size_bytes,
+            stats.size_actual_bytes,
+            stats.size_utilized_bytes,
+            stats.num_objects,
+            json.dumps(stats.usage) if stats.usage else '{}',
+            json.dumps(stats.bucket_quota) if stats.bucket_quota else '{}',
+            stats.sync_status,
+            stats.sync_behind_shards,
+            stats.sync_behind_entries,
             stats.sync_source_zone,
-            stats.collected_at, stats.collection_duration_ms
+            stats.collected_at,
+            stats.collection_duration_ms
         ])
         
         # Save to history (sampling - not every update)
@@ -110,12 +208,15 @@ class Storage:
                   stats.sync_behind_shards, stats.sync_behind_entries, stats.collected_at])
         
         # Update storage class usage
-        for sc_name, sc_data in stats.storage_classes.items():
+        for sc_name, sc_data in (stats.usage or {}).items():
             self.conn.execute("""
-                INSERT OR REPLACE INTO storage_class_usage VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO storage_class_usage VALUES (?, ?, ?, ?, ?, ?, ?)
             """, [
                 stats.bucket_name, sc_name,
-                sc_data.get('size', 0), sc_data.get('num_objects', 0),
+                sc_data.get('size', 0),
+                sc_data.get('size_actual', 0),
+                sc_data.get('size_utilized', 0),
+                sc_data.get('num_objects', 0),
                 stats.collected_at
             ])
     
@@ -123,10 +224,11 @@ class Storage:
         """Get buckets that haven't been updated within threshold."""
         threshold_time = datetime.utcnow() - timedelta(seconds=threshold_seconds)
         
+        # Include NULL collected_at as stale
         result = self.conn.execute("""
             SELECT bucket_name FROM bucket_stats 
-            WHERE collected_at < ?
-            ORDER BY collected_at ASC
+            WHERE collected_at IS NULL OR collected_at < ?
+            ORDER BY collected_at ASC NULLS FIRST
             LIMIT ?
         """, [threshold_time, limit]).fetchall()
         
@@ -204,9 +306,27 @@ class Storage:
         """Count how many buckets are stale."""
         threshold_time = datetime.utcnow() - timedelta(seconds=threshold_seconds)
         result = self.conn.execute("""
-            SELECT COUNT(*) FROM bucket_stats WHERE collected_at < ?
+            SELECT COUNT(*) FROM bucket_stats 
+            WHERE collected_at IS NULL OR collected_at < ?
         """, [threshold_time]).fetchone()
         return result[0]
+    
+    def get_freshness_stats(self) -> Dict[str, Any]:
+        """Get freshness statistics for debugging."""
+        result = self.conn.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN collected_at IS NULL THEN 1 ELSE 0 END) as null_count,
+                MIN(collected_at) as oldest,
+                MAX(collected_at) as newest
+            FROM bucket_stats
+        """).fetchone()
+        return {
+            'total': result[0],
+            'null_collected_at': result[1],
+            'oldest': result[2],
+            'newest': result[3]
+        }
     
     def query(self, sql: str) -> Any:
         """Execute custom SQL query."""

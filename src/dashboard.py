@@ -457,3 +457,202 @@ def run_dashboard(db_path: str, command: str = 'status', **kwargs):
         dashboard.live_monitor(refresh_seconds=kwargs.get('refresh', 5))
     else:
         print(f"Unknown command: {command}")
+
+
+class CacheDashboard:
+    """Dashboard that reads from JSON cache file (no DB lock)."""
+    
+    def __init__(self, cache_path: str):
+        if not HAS_RICH:
+            raise ImportError("rich library required: pip install rich")
+        
+        self.cache_path = cache_path
+        self.console = Console()
+        self.running = True
+    
+    def _load_cache(self):
+        """Load data from cache file."""
+        import json
+        try:
+            with open(self.cache_path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            return None
+    
+    def show_status(self):
+        """Show cluster status from cache."""
+        data = self._load_cache()
+        if not data:
+            self.console.print(f"[red]ERROR: Cannot read cache file: {self.cache_path}[/red]")
+            return
+        
+        summary = data.get('summary', {})
+        freshness = data.get('freshness', {})
+        cache_updated = data.get('_cache_updated', 'Unknown')
+        
+        # Summary panel
+        summary_text = f"""
+[bold]Total Buckets:[/bold]  {summary.get('total_buckets', 0):,}
+[bold]Total Owners:[/bold]   {summary.get('total_owners', 0):,}
+[bold]Total Objects:[/bold]  {summary.get('total_objects', 0):,}
+[bold]Total Size:[/bold]     {format_bytes(summary.get('total_size_bytes', 0))}
+
+[bold]Cache Updated:[/bold]  {cache_updated}
+"""
+        self.console.print(Panel(summary_text, title="Cluster Summary (from cache)", border_style="green"))
+        
+        # Freshness
+        fresh_table = Table(title="Data Freshness")
+        fresh_table.add_column("Age", style="cyan")
+        fresh_table.add_column("Count", justify="right")
+        
+        for key in ['fresh_10m', 'fresh_1h', 'fresh_24h', 'stale']:
+            label = {'fresh_10m': '<10 min', 'fresh_1h': '<1 hour', 
+                     'fresh_24h': '<24 hours', 'stale': '>24 hours'}.get(key, key)
+            count = freshness.get(key, 0)
+            style = "green" if key == 'fresh_10m' else ("yellow" if key == 'fresh_1h' else "red")
+            fresh_table.add_row(label, f"[{style}]{count}[/{style}]")
+        
+        self.console.print(fresh_table)
+    
+    def show_top_buckets(self, limit: int = 20):
+        """Show top buckets from cache."""
+        data = self._load_cache()
+        if not data:
+            self.console.print(f"[red]ERROR: Cannot read cache file: {self.cache_path}[/red]")
+            return
+        
+        buckets = data.get('top_by_size', [])[:limit]
+        
+        table = Table(title=f"Top {limit} Buckets by Size (from cache)")
+        table.add_column("Bucket", style="cyan", max_width=40)
+        table.add_column("Owner", style="dim", max_width=20)
+        table.add_column("Size", justify="right")
+        table.add_column("Objects", justify="right")
+        table.add_column("Shards", justify="right")
+        
+        for b in buckets:
+            table.add_row(
+                b.get('bucket_name', '')[:40],
+                (b.get('owner') or '')[:20],
+                format_bytes(b.get('size_bytes', 0)),
+                f"{b.get('num_objects', 0):,}",
+                str(b.get('num_shards', 0))
+            )
+        
+        self.console.print(table)
+    
+    def show_by_owner(self, limit: int = 30):
+        """Show buckets grouped by owner from cache."""
+        data = self._load_cache()
+        if not data:
+            self.console.print(f"[red]ERROR: Cannot read cache file: {self.cache_path}[/red]")
+            return
+        
+        owners = data.get('by_owner', [])[:limit]
+        
+        table = Table(title=f"Top {limit} Owners by Size (from cache)")
+        table.add_column("Owner", style="cyan", max_width=30)
+        table.add_column("Buckets", justify="right")
+        table.add_column("Total Size", justify="right")
+        table.add_column("Total Objects", justify="right")
+        
+        for o in owners:
+            table.add_row(
+                (o.get('owner') or 'unknown')[:30],
+                str(o.get('bucket_count', 0)),
+                format_bytes(o.get('total_size', 0)),
+                f"{o.get('total_objects', 0):,}"
+            )
+        
+        self.console.print(table)
+    
+    def show_sync_status(self, limit: int = 30):
+        """Show sync status from cache."""
+        data = self._load_cache()
+        if not data:
+            self.console.print(f"[red]ERROR: Cannot read cache file: {self.cache_path}[/red]")
+            return
+        
+        sync_summary = data.get('sync_summary', {})
+        sync_behind = data.get('sync_behind', [])[:limit]
+        
+        # Sync summary
+        summary_table = Table(title="Sync Status Summary (from cache)")
+        summary_table.add_column("Status", style="cyan")
+        summary_table.add_column("Count", justify="right")
+        
+        for status, count in sync_summary.items():
+            style = "green" if status == 'synced' else "red"
+            summary_table.add_row(status, f"[{style}]{count}[/{style}]")
+        
+        self.console.print(summary_table)
+        
+        # Buckets behind
+        if sync_behind:
+            behind_table = Table(title=f"Buckets Behind (top {limit})")
+            behind_table.add_column("Bucket", style="cyan", max_width=40)
+            behind_table.add_column("Owner", style="dim", max_width=20)
+            behind_table.add_column("Shards Behind", justify="right", style="red")
+            behind_table.add_column("Entries Behind", justify="right", style="red")
+            
+            for b in sync_behind:
+                behind_table.add_row(
+                    b.get('bucket_name', '')[:40],
+                    (b.get('owner') or '')[:20],
+                    str(b.get('shards_behind', 0)),
+                    str(b.get('entries_behind', 0))
+                )
+            
+            self.console.print(behind_table)
+    
+    def live_monitor(self, refresh_seconds: int = 5):
+        """Live monitoring from cache (refreshes automatically)."""
+        self.console.print("[bold green]Live Monitor (from cache)[/bold green]")
+        self.console.print(f"[dim]Refreshing every {refresh_seconds}s... (Ctrl+C to exit)[/dim]\n")
+        
+        try:
+            while self.running:
+                self.console.clear()
+                self.console.print(f"[bold]RGW Stats Dashboard[/bold] | "
+                                  f"Cache: {self.cache_path} | "
+                                  f"Time: {datetime.now().strftime('%H:%M:%S')}\n")
+                
+                self.show_status()
+                self.console.print()
+                self.show_top_buckets(limit=10)
+                
+                self.console.print(f"\n[dim]Refreshing in {refresh_seconds}s... (Ctrl+C to exit)[/dim]")
+                
+                for _ in range(refresh_seconds):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+        except KeyboardInterrupt:
+            self.running = False
+            self.console.print("\n[yellow]Monitor stopped.[/yellow]")
+
+
+def run_dashboard_from_cache(cache_path: str, command: str = 'status', **kwargs):
+    """Run dashboard from cache file (no DB lock)."""
+    if not HAS_RICH:
+        print("ERROR: rich library required. Install with: pip install rich")
+        sys.exit(1)
+    
+    dashboard = CacheDashboard(cache_path)
+    
+    if command == 'status':
+        dashboard.show_status()
+    elif command == 'top':
+        dashboard.show_top_buckets(limit=kwargs.get('limit', 20))
+    elif command == 'sync':
+        dashboard.show_sync_status(limit=kwargs.get('limit', 30))
+    elif command == 'all':
+        dashboard.show_by_owner(limit=kwargs.get('limit', 50))
+    elif command == 'live':
+        dashboard.live_monitor(refresh_seconds=kwargs.get('refresh', 5))
+    else:
+        # For commands not supported in cache mode, show status
+        print(f"Note: '{command}' view not available in cache mode. Showing status instead.")
+        dashboard.show_status()

@@ -20,3 +20,23 @@
 
 
 - The DB locking issue, where the collector keep the lock and dashboard would fails to do.
+
+- Scalability is still not there.
+----
+No what I meant was not the feasiblity of scaling but not getting scaled actually.
+
+On reviewing the number of radosgw-admin commands running in the system, i found that max number is not even crossing 50 
+
+Since this code as of now works in batches of 100 buckets which get's done in 6 sec means 16-20 buckets get processed in a second. 
+But i want this code to actually process 150-200 buckets per seconds mean there should be 200 radosgw-admin commands running instantly 
+----
+
+
+
++++ Latest 7:15pm +++
+the current bulk pull, pull all of the bucket stats but it did not update all of them rather
+it update only the stale bucket entry.
+    - this cause the issue is that for the next incremental those left out stale entries will also cause this complete pull again.
+    - So sometime, we eventually ended up with multiple full bucket stats execution.
+
+    

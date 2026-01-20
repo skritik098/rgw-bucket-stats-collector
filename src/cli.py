@@ -39,7 +39,7 @@ def cmd_collect(args):
         collect_sync_status=args.collect_sync
     )
     
-    collector = Collector(config)
+    collector = Collector(config, cache_path=getattr(args, 'cache', None))
     
     try:
         if args.continuous:
@@ -64,7 +64,7 @@ def cmd_bootstrap(args):
         collect_sync_status=args.collect_sync
     )
     
-    collector = Collector(config)
+    collector = Collector(config, cache_path=getattr(args, 'cache', None))
     
     try:
         result = collector.run_bootstrap(verbose=True)
@@ -80,6 +80,7 @@ def cmd_status(args):
     storage = Storage(args.db)
     
     summary = storage.get_summary()
+    freshness = storage.get_freshness_stats()
     
     print("\n" + "=" * 50)
     print("RGW BUCKET STATS STATUS")
@@ -90,10 +91,19 @@ def cmd_status(args):
     print(f"  Total objects:  {summary['total_objects']:,}")
     print(f"  Total size:     {format_bytes(summary['total_size_bytes'])}")
     
-    if summary['oldest_collection']:
-        print(f"  Oldest data:    {summary['oldest_collection']}")
-        print(f"  Newest data:    {summary['newest_collection']}")
+    print("-" * 50)
+    print("Timestamp Info:")
+    if freshness['null_collected_at']:
+        print(f"  [WARN] NULL timestamps: {freshness['null_collected_at']}")
+        print(f"         Run 'repair' command to fix")
+    if freshness['oldest']:
+        print(f"  Oldest data:    {freshness['oldest']}")
+        print(f"  Newest data:    {freshness['newest']}")
+    else:
+        print(f"  No timestamp data found")
     
+    print("-" * 50)
+    print("Stale Buckets:")
     # Stale buckets
     for threshold in [60, 300, 600, 3600]:
         stale = storage.get_stale_count(threshold)
@@ -334,20 +344,107 @@ def cmd_comparison(args):
 
 def cmd_dashboard(args):
     """Launch CLI dashboard."""
-    try:
-        from .dashboard import run_dashboard
-    except ImportError:
-        print("ERROR: rich library required for dashboard. Install with: pip install rich")
-        sys.exit(1)
+    cache_path = getattr(args, 'cache', None)
     
-    run_dashboard(
-        db_path=args.db,
-        command=args.view,
-        limit=args.limit,
-        days=args.days,
-        sort=args.sort,
-        refresh=args.refresh
-    )
+    if cache_path:
+        # Use cache-based dashboard (no DB lock)
+        try:
+            from .dashboard import run_dashboard_from_cache
+            run_dashboard_from_cache(
+                cache_path=cache_path,
+                command=args.view,
+                limit=args.limit,
+                refresh=args.refresh
+            )
+        except ImportError:
+            print("ERROR: rich library required for dashboard. Install with: pip install rich")
+            sys.exit(1)
+    else:
+        # Use DB-based dashboard
+        try:
+            from .dashboard import run_dashboard
+        except ImportError:
+            print("ERROR: rich library required for dashboard. Install with: pip install rich")
+            sys.exit(1)
+        
+        run_dashboard(
+            db_path=args.db,
+            command=args.view,
+            limit=args.limit,
+            days=args.days,
+            sort=args.sort,
+            refresh=args.refresh
+        )
+
+
+def cmd_export(args):
+    """Export bucket stats in radosgw-admin JSON format."""
+    analytics = Analytics(args.db)
+    
+    try:
+        if args.bucket:
+            # Export single bucket
+            data = analytics.export_bucket_stats(args.bucket)
+            if data is None:
+                print(f"ERROR: Bucket '{args.bucket}' not found in database", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # Export all buckets
+            data = analytics.export_all_bucket_stats(limit=args.limit)
+        
+        # Output
+        import json
+        output = json.dumps(data, indent=4 if not args.compact else None)
+        
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(output)
+            print(f"Exported to {args.output}", file=sys.stderr)
+        else:
+            print(output)
+    
+    finally:
+        analytics.close()
+
+
+def cmd_repair(args):
+    """Repair database issues like NULL timestamps."""
+    from datetime import datetime
+    
+    storage = Storage(args.db)
+    
+    print("\n" + "=" * 50)
+    print("DATABASE REPAIR")
+    print("=" * 50)
+    
+    # Check for NULL collected_at
+    freshness = storage.get_freshness_stats()
+    null_count = freshness.get('null_collected_at', 0) or 0
+    
+    if null_count == 0:
+        print("  ✓ No issues found - all timestamps are valid")
+        print("=" * 50 + "\n")
+        storage.close()
+        return
+    
+    print(f"  Found {null_count} buckets with NULL collected_at")
+    
+    if args.dry_run:
+        print("  [DRY RUN] Would update these to current timestamp")
+        print("  Run without --dry-run to apply fix")
+    else:
+        # Fix NULL timestamps
+        now = datetime.utcnow()
+        storage.conn.execute("""
+            UPDATE bucket_stats 
+            SET collected_at = ? 
+            WHERE collected_at IS NULL
+        """, [now])
+        storage.commit()
+        print(f"  ✓ Updated {null_count} buckets with timestamp: {now}")
+    
+    print("=" * 50 + "\n")
+    storage.close()
 
 
 def main():
@@ -359,6 +456,9 @@ Examples:
   # One-time collection of all buckets
   %(prog)s collect --db stats.duckdb
   
+  # Bootstrap mode (fast initial collection)
+  %(prog)s bootstrap --db stats.duckdb
+  
   # Continuous mode - update stale buckets every 5 min
   %(prog)s collect --db stats.duckdb --continuous
   
@@ -366,15 +466,17 @@ Examples:
   %(prog)s collect --db stats.duckdb --continuous \\
       --refresh-interval 60 --stale-threshold 300
   
-  # Test with limited buckets
-  %(prog)s collect --db stats.duckdb --limit 10 --verbose
-  
   # Check status
   %(prog)s status --db stats.duckdb
   
   # Query data
   %(prog)s query --db stats.duckdb --type top-buckets
   %(prog)s query --db stats.duckdb --type by-owner
+  
+  # Export in radosgw-admin format
+  %(prog)s export --db stats.duckdb                      # All buckets
+  %(prog)s export --db stats.duckdb --bucket my-bucket   # Single bucket
+  %(prog)s export --db stats.duckdb -o output.json       # To file
         """
     )
     
@@ -407,6 +509,8 @@ Examples:
                           help='Command timeout seconds (default: 60)')
     collect_p.add_argument('--ceph-conf', default='/etc/ceph/ceph.conf',
                           help='Ceph config path')
+    collect_p.add_argument('--cache', 
+                          help='JSON cache file for dashboard (avoids DB lock)')
     collect_p.add_argument('--limit', type=int,
                           help='Limit buckets to collect (for testing)')
     collect_p.add_argument('--verbose', '-v', action='store_true',
@@ -426,11 +530,19 @@ Examples:
                             help='Command timeout seconds (default: 60)')
     bootstrap_p.add_argument('--ceph-conf', default='/etc/ceph/ceph.conf',
                             help='Ceph config path')
+    bootstrap_p.add_argument('--cache',
+                            help='JSON cache file for dashboard (avoids DB lock)')
     bootstrap_p.set_defaults(func=cmd_bootstrap)
     
     # Status
     status_p = subparsers.add_parser('status', help='Show collection status')
     status_p.set_defaults(func=cmd_status)
+    
+    # Repair
+    repair_p = subparsers.add_parser('repair', help='Repair database issues (NULL timestamps)')
+    repair_p.add_argument('--dry-run', action='store_true',
+                         help='Show what would be fixed without making changes')
+    repair_p.set_defaults(func=cmd_repair)
     
     # Query
     query_p = subparsers.add_parser('query', help='Query collected data')
@@ -494,7 +606,21 @@ Examples:
                             help='Sort order for --view all (default: age)')
     dashboard_p.add_argument('--refresh', type=int, default=5,
                             help='Refresh interval for --view live (default: 5s)')
+    dashboard_p.add_argument('--cache',
+                            help='Read from JSON cache file instead of DB (avoids lock)')
     dashboard_p.set_defaults(func=cmd_dashboard)
+    
+    # Export (reconstruct radosgw-admin bucket stats format from DB)
+    export_p = subparsers.add_parser('export', help='Export bucket stats in radosgw-admin JSON format')
+    export_p.add_argument('--bucket', '-b',
+                         help='Specific bucket to export (default: all buckets)')
+    export_p.add_argument('--output', '-o',
+                         help='Output file (default: stdout)')
+    export_p.add_argument('--limit', type=int,
+                         help='Limit number of buckets (default: no limit)')
+    export_p.add_argument('--compact', action='store_true',
+                         help='Compact JSON output (no indentation)')
+    export_p.set_defaults(func=cmd_export)
     
     args = parser.parse_args()
     

@@ -410,3 +410,155 @@ class Analytics:
         result = self.conn.execute(sql)
         cols = [d[0] for d in result.description]
         return [dict(zip(cols, row)) for row in result.fetchall()]
+    
+    # =========================================================================
+    # EXPORT - Reconstruct radosgw-admin bucket stats format from DB
+    # =========================================================================
+    
+    def export_bucket_stats(self, bucket_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Export a single bucket's stats in exact radosgw-admin format.
+        
+        This reconstructs the original JSON format from stored DB data.
+        
+        Args:
+            bucket_name: Name of the bucket
+        
+        Returns:
+            Dict matching radosgw-admin bucket stats output, or None if not found
+        """
+        import json
+        
+        row = self.conn.execute("""
+            SELECT bucket_name, bucket_id, marker, tenant, owner, zonegroup,
+                   placement_rule, explicit_placement, num_shards, index_type,
+                   versioning, versioned, versioning_enabled, object_lock_enabled,
+                   mfa_enabled, ver, master_ver, max_marker, mtime, creation_time,
+                   usage, bucket_quota
+            FROM bucket_stats WHERE bucket_name = ?
+        """, [bucket_name]).fetchone()
+        
+        if not row:
+            return None
+        
+        # Parse JSON fields
+        explicit_placement = json.loads(row[7]) if row[7] else {"data_pool": "", "data_extra_pool": "", "index_pool": ""}
+        usage = json.loads(row[20]) if row[20] else {}
+        bucket_quota = json.loads(row[21]) if row[21] else {
+            "enabled": False, "check_on_raw": False,
+            "max_size": -1, "max_size_kb": 0, "max_objects": -1
+        }
+        
+        # Reconstruct exact radosgw-admin format
+        return {
+            "bucket": row[0],
+            "num_shards": row[8],
+            "tenant": row[3] or "",
+            "versioning": row[10] or "off",
+            "zonegroup": row[5] or "",
+            "placement_rule": row[6] or "",
+            "explicit_placement": explicit_placement,
+            "id": row[1] or "",
+            "marker": row[2] or row[1] or "",
+            "index_type": row[9] or "Normal",
+            "versioned": row[11] or False,
+            "versioning_enabled": row[12] or False,
+            "object_lock_enabled": row[13] or False,
+            "mfa_enabled": row[14] or False,
+            "owner": row[4] or "",
+            "ver": row[15] or "",
+            "master_ver": row[16] or "",
+            "mtime": row[18] or "",
+            "creation_time": row[19] or "",
+            "max_marker": row[17] or "",
+            "usage": usage,
+            "bucket_quota": bucket_quota
+        }
+    
+    def export_all_bucket_stats(self, limit: int = None) -> List[Dict[str, Any]]:
+        """
+        Export all buckets' stats in exact radosgw-admin format.
+        
+        This matches the output of: radosgw-admin bucket stats (without --bucket)
+        
+        Args:
+            limit: Optional limit on number of buckets
+        
+        Returns:
+            List of dicts, each matching radosgw-admin bucket stats format
+        """
+        import json
+        
+        query = """
+            SELECT bucket_name, bucket_id, marker, tenant, owner, zonegroup,
+                   placement_rule, explicit_placement, num_shards, index_type,
+                   versioning, versioned, versioning_enabled, object_lock_enabled,
+                   mfa_enabled, ver, master_ver, max_marker, mtime, creation_time,
+                   usage, bucket_quota
+            FROM bucket_stats
+            ORDER BY bucket_name
+        """
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        rows = self.conn.execute(query).fetchall()
+        results = []
+        
+        for row in rows:
+            explicit_placement = json.loads(row[7]) if row[7] else {"data_pool": "", "data_extra_pool": "", "index_pool": ""}
+            usage = json.loads(row[20]) if row[20] else {}
+            bucket_quota = json.loads(row[21]) if row[21] else {
+                "enabled": False, "check_on_raw": False,
+                "max_size": -1, "max_size_kb": 0, "max_objects": -1
+            }
+            
+            results.append({
+                "bucket": row[0],
+                "num_shards": row[8],
+                "tenant": row[3] or "",
+                "versioning": row[10] or "off",
+                "zonegroup": row[5] or "",
+                "placement_rule": row[6] or "",
+                "explicit_placement": explicit_placement,
+                "id": row[1] or "",
+                "marker": row[2] or row[1] or "",
+                "index_type": row[9] or "Normal",
+                "versioned": row[11] or False,
+                "versioning_enabled": row[12] or False,
+                "object_lock_enabled": row[13] or False,
+                "mfa_enabled": row[14] or False,
+                "owner": row[4] or "",
+                "ver": row[15] or "",
+                "master_ver": row[16] or "",
+                "mtime": row[18] or "",
+                "creation_time": row[19] or "",
+                "max_marker": row[17] or "",
+                "usage": usage,
+                "bucket_quota": bucket_quota
+            })
+        
+        return results
+    
+    def export_bucket_stats_json(self, bucket_name: str = None, 
+                                  indent: int = 4) -> str:
+        """
+        Export bucket stats as JSON string (exact radosgw-admin format).
+        
+        Args:
+            bucket_name: Specific bucket (None = all buckets)
+            indent: JSON indentation (default 4)
+        
+        Returns:
+            JSON string matching radosgw-admin output
+        """
+        import json
+        
+        if bucket_name:
+            data = self.export_bucket_stats(bucket_name)
+        else:
+            data = self.export_all_bucket_stats()
+        
+        if data is None:
+            return "{}"
+        
+        return json.dumps(data, indent=indent)
