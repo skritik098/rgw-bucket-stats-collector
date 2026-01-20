@@ -33,13 +33,13 @@ pip install duckdb
 pip install rich  # Optional, for dashboard
 
 # Bootstrap (cold start)
-python main.py bootstrap --db stats.duckdb --workers 50
+python main.py --db stats.duckdb bootstrap --workers 50
 
 # Continuous mode
-python main.py collect --db stats.duckdb --continuous
+python main.py --db stats.duckdb collect --continuous
 
 # Dashboard
-python main.py dashboard --db stats.duckdb --view live
+python main.py --db stats.duckdb dashboard --view live
 ```
 
 ## Bootstrap Mode (Cold Start)
@@ -47,14 +47,14 @@ python main.py dashboard --db stats.duckdb --view live
 For initial collection when DB is empty:
 
 ```bash
-python main.py bootstrap --db stats.duckdb --workers 50
-python main.py bootstrap --db stats.duckdb --workers 50 --collect-sync  # With sync
+python main.py --db stats.duckdb bootstrap --workers 50
+python main.py --db stats.duckdb bootstrap --workers 50 --collect-sync  # With sync
 ```
 
 ## Continuous Mode
 
 ```bash
-python main.py collect --db stats.duckdb --continuous \
+python main.py --db stats.duckdb collect --continuous \
     --stale-threshold 1800 \
     --max-workers 100
 ```
@@ -62,30 +62,30 @@ python main.py collect --db stats.duckdb --continuous \
 ## Dashboard
 
 ```bash
-python main.py dashboard --db stats.duckdb --view status
-python main.py dashboard --db stats.duckdb --view compare --days 7
-python main.py dashboard --db stats.duckdb --view sync
-python main.py dashboard --db stats.duckdb --view live
+python main.py --db stats.duckdb dashboard --view status
+python main.py --db stats.duckdb dashboard --view compare --days 7
+python main.py --db stats.duckdb dashboard --view sync
+python main.py --db stats.duckdb dashboard --view live
 ```
 
 ## Per-Bucket Comparison
 
 ```bash
-python main.py comparison --db stats.duckdb --days 7 --limit 50
+python main.py --db stats.duckdb comparison --days 7 --limit 50
 ```
 
 ## Analytics
 
 ```bash
-python main.py analytics --db stats.duckdb --type growth --days 30
-python main.py analytics --db stats.duckdb --type fastest-growing
-python main.py analytics --db stats.duckdb --type freshness
-python main.py analytics --db stats.duckdb --type forecast
-python main.py analytics --db stats.duckdb --type sync
+python main.py --db stats.duckdb analytics --type growth --days 30
+python main.py --db stats.duckdb analytics --type fastest-growing
+python main.py --db stats.duckdb analytics --type freshness
+python main.py --db stats.duckdb analytics --type forecast
+python main.py --db stats.duckdb analytics --type sync
 ```
 
 ## Bucket History
 
 ```bash
-python main.py history --db stats.duckdb my-bucket-name --days 30
+python main.py --db stats.duckdb history my-bucket-name --days 30
 ```
