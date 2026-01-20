@@ -1,0 +1,22 @@
+### Issues or TO-DO List 
+
+- The current script doesn't work with the COLD start scenario where the DB needs to be updated 
+    and when the buckets count is already huge in the cluster.
+
+- In the simialr aspect of above point, the multi-thread concept doesn't get scaled to 100 workers in the execution.
+    - For 100 buckets, it took 5-6 sec, so if we have 15000 buckets and threshold value set to 10 mins will make 10k buckets get readded in the stale bucket along with remaining 5000
+    - So the either scaling needs to be fixed to collect data in much more optimized way or scaled it way to collect the bucket stats for 1000s buckets in seconds.
+    - Or update the default threshold to a certain value where large scale cluster can be managed. 
+
+- There is no per bucket historical analytics available even though the code is available to do: 
+    - historical global analytics and each bucket historical data stats historical anlytics **manually**
+    - But there is no code base to show a comparision for each bucket in a tabular format.
+
+- The current code also doesn't keep track of the sync activity for each bucket along with the bucket stats on the site where it is running.
+
+- There is no Dashboard to view the overall track of such activity:
+    - Updating the bucket stats as like how old the bucket stats is same as the oldest collected time
+    - CLI based method would be great to have for this.
+
+
+- The DB locking issue, where the collector keep the lock and dashboard would fails to do.
