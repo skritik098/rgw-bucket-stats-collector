@@ -59,13 +59,13 @@ pip install rich  # Optional, for dashboard
 
 ```bash
 # Bootstrap - fast initial collection (~3 min for 28K buckets)
-python main.py --db stats.duckdb bootstrap
+python main.py bootstrap --db stats.duckdb
 
 # Check status
-python main.py --db stats.duckdb status
+python main.py status --db stats.duckdb
 
 # Continuous mode with cache for dashboard
-python main.py --db stats.duckdb collect --continuous --cache stats_cache.json
+python main.py collect --db stats.duckdb --continuous --cache stats_cache.json
 
 # Dashboard (reads from cache - no DB lock)
 python main.py dashboard --cache stats_cache.json --view live
@@ -79,13 +79,13 @@ Fast initial collection using single bulk command:
 
 ```bash
 # Basic bootstrap
-python main.py --db stats.duckdb bootstrap
+python main.py bootstrap --db stats.duckdb
 
 # With JSON cache for dashboard
-python main.py --db stats.duckdb bootstrap --cache stats_cache.json
+python main.py bootstrap --db stats.duckdb --cache stats_cache.json
 
 # With multisite sync status
-python main.py --db stats.duckdb bootstrap --collect-sync
+python main.py bootstrap --db stats.duckdb --collect-sync
 ```
 
 **Performance**: ~3 minutes for 28,000 buckets (vs ~30 min with per-bucket approach)
@@ -94,13 +94,13 @@ python main.py --db stats.duckdb bootstrap --collect-sync
 
 ```bash
 # One-time collection
-python main.py --db stats.duckdb collect
+python main.py collect --db stats.duckdb
 
 # Continuous mode (daemon)
-python main.py --db stats.duckdb collect --continuous
+python main.py collect --db stats.duckdb --continuous
 
 # With custom thresholds
-python main.py --db stats.duckdb collect --continuous \
+python main.py collect --db stats.duckdb --continuous \
     --stale-threshold 1800 \
     --refresh-interval 300 \
     --cache stats_cache.json
@@ -115,7 +115,7 @@ python main.py --db stats.duckdb collect --continuous \
 Check database status and data freshness:
 
 ```bash
-python main.py --db stats.duckdb status
+python main.py status --db stats.duckdb
 ```
 
 Output:
@@ -147,24 +147,187 @@ Interactive CLI dashboard (requires `rich` library):
 
 ```bash
 # From database
-python main.py --db stats.duckdb dashboard --view status
-python main.py --db stats.duckdb dashboard --view top --limit 50
-python main.py --db stats.duckdb dashboard --view sync
-python main.py --db stats.duckdb dashboard --view live --refresh 5
+python main.py dashboard --db stats.duckdb --view status
+python main.py dashboard --db stats.duckdb --view top --limit 50
+python main.py dashboard --db stats.duckdb --view sync
+python main.py dashboard --db stats.duckdb --view live --refresh 5
 
 # From cache (no DB lock - use while collector is running)
 python main.py dashboard --cache stats_cache.json --view status
 python main.py dashboard --cache stats_cache.json --view live
 ```
 
-**Views**:
-- `status`: Cluster summary and freshness
-- `top`: Top buckets by size
-- `sync`: Multisite sync status
-- `compare`: Size comparison over time
-- `growth`: Growth analysis
-- `all`: All buckets listing
-- `live`: Auto-refreshing monitor
+#### View: `status` - Cluster Summary
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Cluster Summary                                  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  Total Buckets:   28,176                                                     │
+│  Total Owners:    1,523                                                      │
+│  Total Objects:   15,234,567                                                 │
+│  Total Size:      4.2 TB                                                     │
+│                                                                              │
+│  Oldest Data:     2025-01-20 10:15:23                                        │
+│  Newest Data:     2025-01-20 12:30:45                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+                              Data Freshness
+┌─────────────────┬───────────┐
+│ Age             │     Count │
+├─────────────────┼───────────┤
+│ < 10 min        │    27,892 │
+│ < 1 hour        │       284 │
+│ < 24 hours      │         0 │
+│ > 24 hours      │         0 │
+└─────────────────┴───────────┘
+```
+
+#### View: `top` - Top Buckets by Size
+
+```
+                        Top 20 Buckets by Size
+┌──────────────────────────────────┬──────────────┬───────────┬──────────┬────────┐
+│ Bucket                           │ Owner        │      Size │  Objects │ Shards │
+├──────────────────────────────────┼──────────────┼───────────┼──────────┼────────┤
+│ production-data-backup           │ admin        │  512.4 GB │  892,341 │     64 │
+│ analytics-warehouse              │ data-team    │  384.2 GB │  234,521 │     32 │
+│ user-uploads-2024                │ app-service  │  256.8 GB │1,234,567 │     32 │
+│ logs-archive                     │ ops          │  198.3 GB │8,234,123 │     16 │
+│ ml-training-datasets             │ ml-team      │  156.7 GB │   12,345 │     16 │
+│ static-assets-cdn                │ frontend     │  128.4 GB │  567,890 │     16 │
+│ database-backups                 │ dba          │   98.2 GB │    1,234 │     11 │
+│ media-transcoded                 │ media-svc    │   87.6 GB │   45,678 │     11 │
+│ customer-documents               │ app-service  │   76.5 GB │  234,567 │     11 │
+│ temp-processing                  │ batch-jobs   │   65.4 GB │  123,456 │     11 │
+│ ...                              │ ...          │       ... │      ... │    ... │
+└──────────────────────────────────┴──────────────┴───────────┴──────────┴────────┘
+```
+
+#### View: `sync` - Multisite Sync Status
+
+```
+                           Sync Status Summary
+┌─────────────────┬───────────┐
+│ Status          │     Count │
+├─────────────────┼───────────┤
+│ synced          │    27,845 │
+│ behind          │       312 │
+│ error           │        19 │
+└─────────────────┴───────────┘
+
+                     Buckets Behind (Top 30)
+┌──────────────────────────────────┬──────────────┬────────┬─────────────────┐
+│ Bucket                           │ Owner        │ Shards │ Entries Behind  │
+├──────────────────────────────────┼──────────────┼────────┼─────────────────┤
+│ high-traffic-uploads             │ app-service  │      8 │          45,231 │
+│ realtime-events                  │ streaming    │      4 │          12,456 │
+│ user-sessions                    │ auth-svc     │      2 │           8,934 │
+│ analytics-ingest                 │ data-team    │      1 │           5,672 │
+│ ...                              │ ...          │    ... │             ... │
+└──────────────────────────────────┴──────────────┴────────┴─────────────────┘
+```
+
+#### View: `compare` - Size Comparison Over Time
+
+```
+                    Size Comparison (7 days ago)
+┌────────────────────────────┬──────────────┬───────────┬───────────┬──────────┐
+│ Bucket                     │ Owner        │   Current │    7d Ago │   Change │
+├────────────────────────────┼──────────────┼───────────┼───────────┼──────────┤
+│ production-data-backup     │ admin        │  512.4 GB │  498.2 GB │   +2.8%  │
+│ analytics-warehouse        │ data-team    │  384.2 GB │  356.8 GB │   +7.7%  │
+│ user-uploads-2024          │ app-service  │  256.8 GB │  245.1 GB │   +4.8%  │
+│ logs-archive               │ ops          │  198.3 GB │  187.6 GB │   +5.7%  │
+│ ml-training-datasets       │ ml-team      │  156.7 GB │  156.7 GB │   +0.0%  │
+│ temp-processing            │ batch-jobs   │   65.4 GB │   89.2 GB │  -26.7%  │
+│ ...                        │ ...          │       ... │       ... │      ... │
+└────────────────────────────┴──────────────┴───────────┴───────────┴──────────┘
+```
+
+#### View: `growth` - Growth Analysis
+
+```
+                         Cluster Growth (30 days)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Period:          Last 30 days                                               │
+│  Start Size:      3.8 TB                                                     │
+│  Current Size:    4.2 TB                                                     │
+│  Growth:          +421.5 GB (+11.1%)                                         │
+│  Daily Average:   +14.1 GB/day                                               │
+│  Monthly Rate:    +423 GB/month                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+                      Fastest Growing Buckets
+┌──────────────────────────────────┬──────────────┬───────────┬──────────────┐
+│ Bucket                           │ Owner        │    Growth │ Growth Rate  │
+├──────────────────────────────────┼──────────────┼───────────┼──────────────┤
+│ analytics-warehouse              │ data-team    │  +27.4 GB │    +7.7%     │
+│ logs-archive                     │ ops          │  +10.7 GB │    +5.7%     │
+│ user-uploads-2024                │ app-service  │  +11.7 GB │    +4.8%     │
+│ production-data-backup           │ admin        │  +14.2 GB │    +2.8%     │
+│ ...                              │ ...          │       ... │          ... │
+└──────────────────────────────────┴──────────────┴───────────┴──────────────┘
+```
+
+#### View: `all` - All Buckets Listing
+
+```
+                           All Buckets (28,176 total)
+┌──────────────────────────────────┬──────────────┬───────────┬──────────┬─────────┐
+│ Bucket                           │ Owner        │      Size │  Objects │     Age │
+├──────────────────────────────────┼──────────────┼───────────┼──────────┼─────────┤
+│ aaa-test-bucket                  │ dev-user     │    1.2 MB │       12 │      2m │
+│ accounting-reports               │ finance      │   45.6 GB │    2,345 │      3m │
+│ admin-backups                    │ admin        │   12.3 GB │      456 │      1m │
+│ analytics-warehouse              │ data-team    │  384.2 GB │  234,521 │      2m │
+│ api-cache                        │ api-svc      │  234.5 MB │   12,345 │      4m │
+│ ...                              │ ...          │       ... │      ... │     ... │
+│ zzz-archive-2023                 │ archive      │   78.9 GB │   23,456 │      5m │
+└──────────────────────────────────┴──────────────┴───────────┴──────────┴─────────┘
+
+Sort: --sort size | objects | age | name
+```
+
+#### View: `live` - Auto-Refreshing Monitor
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+  RGW Stats Dashboard │ Cache: stats_cache.json │ Time: 12:34:56
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────── Summary ──────────────────────────────────┐
+│  Buckets: 28,176    Owners: 1,523    Objects: 15.2M    Size: 4.2 TB         │
+│  Cache Updated: 2025-01-20 12:34:45 (11s ago)                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+                              Data Freshness
+┌─────────────────┬───────────┐      ┌─────────────── Top 10 by Size ─────────┐
+│ Age             │     Count │      │ Bucket                      │     Size │
+├─────────────────┼───────────┤      ├─────────────────────────────┼──────────┤
+│ < 10 min        │    27,892 │      │ production-data-backup      │ 512.4 GB │
+│ < 1 hour        │       284 │      │ analytics-warehouse         │ 384.2 GB │
+│ < 24 hours      │         0 │      │ user-uploads-2024           │ 256.8 GB │
+│ > 24 hours      │         0 │      │ logs-archive                │ 198.3 GB │
+└─────────────────┴───────────┘      │ ml-training-datasets        │ 156.7 GB │
+                                     │ ...                         │      ... │
+                                     └─────────────────────────────┴──────────┘
+
+───────────────────────────────────────────────────────────────────────────────
+  Refreshing in 5s... (Ctrl+C to exit)
+```
+
+**Views Summary**:
+
+| View | Description | Use Case |
+|------|-------------|----------|
+| `status` | Cluster summary and freshness | Quick health check |
+| `top` | Top buckets by size | Find largest consumers |
+| `sync` | Multisite sync status | Monitor replication |
+| `compare` | Size comparison over time | Track changes |
+| `growth` | Growth analysis | Capacity planning |
+| `all` | All buckets listing | Full inventory |
+| `live` | Auto-refreshing monitor | Real-time monitoring |
 
 ### Export
 
@@ -172,13 +335,13 @@ Export bucket stats in exact `radosgw-admin bucket stats` JSON format:
 
 ```bash
 # Export all buckets
-python main.py --db stats.duckdb export -o all_buckets.json
+python main.py export --db stats.duckdb -o all_buckets.json
 
 # Export single bucket
-python main.py --db stats.duckdb export --bucket my-bucket
+python main.py export --db stats.duckdb --bucket my-bucket
 
 # Compact output (no indentation)
-python main.py --db stats.duckdb export --compact
+python main.py export --db stats.duckdb --compact
 ```
 
 The exported JSON matches the exact format of `radosgw-admin bucket stats`:
@@ -231,12 +394,12 @@ The exported JSON matches the exact format of `radosgw-admin bucket stats`:
 Historical analysis and forecasting:
 
 ```bash
-python main.py --db stats.duckdb analytics --type growth --days 30
-python main.py --db stats.duckdb analytics --type fastest-growing --limit 20
-python main.py --db stats.duckdb analytics --type freshness
-python main.py --db stats.duckdb analytics --type forecast --forecast-days 90
-python main.py --db stats.duckdb analytics --type sync
-python main.py --db stats.duckdb analytics --type sync-behind --limit 50
+python main.py analytics --db stats.duckdb --type growth --days 30
+python main.py analytics --db stats.duckdb --type fastest-growing --limit 20
+python main.py analytics --db stats.duckdb --type freshness
+python main.py analytics --db stats.duckdb --type forecast --forecast-days 90
+python main.py analytics --db stats.duckdb --type sync
+python main.py analytics --db stats.duckdb --type sync-behind --limit 50
 ```
 
 ### Query
@@ -244,9 +407,9 @@ python main.py --db stats.duckdb analytics --type sync-behind --limit 50
 Direct queries on collected data:
 
 ```bash
-python main.py --db stats.duckdb query --type top-buckets --limit 20
-python main.py --db stats.duckdb query --type by-owner
-python main.py --db stats.duckdb query --type empty-buckets
+python main.py query --db stats.duckdb --type top-buckets --limit 20
+python main.py query --db stats.duckdb --type by-owner
+python main.py query --db stats.duckdb --type empty-buckets
 ```
 
 ### History
@@ -254,7 +417,7 @@ python main.py --db stats.duckdb query --type empty-buckets
 View historical data for a specific bucket:
 
 ```bash
-python main.py --db stats.duckdb history my-bucket-name --days 30
+python main.py history --db stats.duckdb my-bucket-name --days 30
 ```
 
 ### Comparison
@@ -262,7 +425,7 @@ python main.py --db stats.duckdb history my-bucket-name --days 30
 Per-bucket comparison showing changes over time:
 
 ```bash
-python main.py --db stats.duckdb comparison --days 7 --limit 50
+python main.py comparison --db stats.duckdb --days 7 --limit 50
 ```
 
 ### Repair
@@ -271,10 +434,10 @@ Fix database issues (NULL timestamps):
 
 ```bash
 # Check what would be fixed
-python main.py --db stats.duckdb repair --dry-run
+python main.py repair --db stats.duckdb --dry-run
 
 # Apply fixes
-python main.py --db stats.duckdb repair
+python main.py repair --db stats.duckdb
 ```
 
 ## Configuration Options
@@ -415,11 +578,11 @@ The cache file contains pre-computed data for fast dashboard access:
 
 Check for NULL timestamps:
 ```bash
-python main.py --db stats.duckdb status
+python main.py status --db stats.duckdb
 # Look for "[WARN] NULL timestamps: X"
 
 # Fix with repair command
-python main.py --db stats.duckdb repair
+python main.py repair --db stats.duckdb
 ```
 
 ### Dashboard can't access DB
@@ -427,7 +590,7 @@ python main.py --db stats.duckdb repair
 Use cache mode instead:
 ```bash
 # Collector writes cache
-python main.py --db stats.duckdb collect --continuous --cache stats_cache.json
+python main.py collect --db stats.duckdb --continuous --cache stats_cache.json
 
 # Dashboard reads from cache (no lock)
 python main.py dashboard --cache stats_cache.json --view live
@@ -445,11 +608,11 @@ The bulk command waits for complete output from `radosgw-admin`. For very large 
 The collector auto-migrates schema on startup. If issues persist:
 ```bash
 # Option 1: Repair
-python main.py --db stats.duckdb repair
+python main.py repair --db stats.duckdb
 
 # Option 2: Fresh start
 rm stats.duckdb
-python main.py --db stats.duckdb bootstrap
+python main.py bootstrap --db stats.duckdb
 ```
 
 ## Examples
@@ -458,11 +621,11 @@ python main.py --db stats.duckdb bootstrap
 
 ```bash
 # Initial bootstrap
-python main.py --db /var/lib/rgw-stats/stats.duckdb bootstrap \
+python main.py bootstrap --db /var/lib/rgw-stats/stats.duckdb \
     --cache /var/lib/rgw-stats/cache.json
 
 # Run as service (continuous mode)
-python main.py --db /var/lib/rgw-stats/stats.duckdb collect \
+python main.py collect --db /var/lib/rgw-stats/stats.duckdb \
     --continuous \
     --stale-threshold 3600 \
     --refresh-interval 300 \
@@ -476,20 +639,22 @@ python main.py dashboard --cache /var/lib/rgw-stats/cache.json --view live
 
 ```bash
 # Export all stats for Prometheus/Grafana
-python main.py --db stats.duckdb export -o /tmp/bucket_stats.json
+python main.py export --db stats.duckdb -o /tmp/bucket_stats.json
 
 # Export specific bucket
-python main.py --db stats.duckdb export --bucket production-data
+python main.py export --db stats.duckdb --bucket production-data
 ```
 
 ### Capacity Planning
 
 ```bash
 # 90-day forecast
-python main.py --db stats.duckdb analytics --type forecast --forecast-days 90
+python main.py analytics --db stats.duckdb --type forecast --forecast-days 90
 
 # Find fastest growing buckets
-python main.py --db stats.duckdb analytics --type fastest-growing --days 30 --limit 20
+python main.py analytics --db stats.duckdb --type fastest-growing --days 30 --limit 20
 ```
 
 ## License
+
+MIT
